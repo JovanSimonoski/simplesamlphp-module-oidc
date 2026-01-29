@@ -7,15 +7,20 @@ namespace SimpleSAML\Module\oidc\Controllers;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use SimpleSAML\Database;
 use SimpleSAML\Module\oidc\Repositories\AccessTokenRepository;
 use SimpleSAML\Module\oidc\Entities\AccessTokenEntity;
 
 class TokenIntrospectionController
 {
+    private readonly Database $database;
+
     public function __construct(
         private readonly AccessTokenRepository $accessTokenRepository,
+        ?Database $database = null,
     )
     {
+        $this->database = $database ?? Database::getInstance();
     }
 
     public function __invoke(Request $request): Response
@@ -35,10 +40,29 @@ class TokenIntrospectionController
             ], 401);
         }
 
-        if (!preg_match('/^Bearer\s+(.+)$/i', $authHeader)) {
+        if (!preg_match('/^Basic\s+(?P<credentials>[A-Za-z0-9+\/=]+)$/', $authHeader, $matches)) {
             return new JsonResponse([
                 'error' => 'invalid_client',
-                'error_description' => 'Invalid authorization header format'
+                'error_description' => 'Invalid Authorization header - Basic auth required with client ID and client secret'
+            ], 401);
+        }
+
+        $decoded = base64_decode($matches['credentials'], true);
+        if ($decoded === false || !str_contains($decoded, ':')) {
+            return new JsonResponse([
+                'error' => 'invalid_client',
+                'error_description' => 'Invalid Basic Auth payload format'
+            ], 401);
+        }
+
+        [$clientId, $clientSecret] = explode(':', $decoded, 2);
+
+        [$isAuthorized, $message] = $this->isAuthorizedBasicAuth($clientId, $clientSecret);
+
+        if (!$isAuthorized) {
+            return new JsonResponse([
+                'error' => 'invalid_client',
+                'error_description' => 'Client authorization failed: ' . $message
             ], 401);
         }
 
@@ -59,6 +83,36 @@ class TokenIntrospectionController
         }
 
         return $this->introspectToken($token);
+    }
+
+    private function isAuthorizedBasicAuth(string $clientId, string $clientSecret): array
+    {
+
+        $db = $this->database;
+        $result = $db->read(
+            'SELECT id, secret, is_enabled, is_confidential FROM oidc_client WHERE id = :id', ['id' => $clientId]
+        );
+
+        $client = $result->fetch(\PDO::FETCH_ASSOC);
+
+        if (!$client) {
+            return [false,'Unknown client ID'];
+        }
+
+
+        if ((int)$client['is_enabled'] !== 1) {
+            return [false,'Client disabled'];
+        }
+
+        if ((int)$client['is_confidential'] !== 1) {
+            return [false,'Client not confidential'];
+        }
+
+        if (!hash_equals($client['secret'], $clientSecret)) {
+            return [false,'Invalid client secret'];
+        }
+
+        return [true, "OK"];
     }
 
     private function introspectToken(string $token): JsonResponse
